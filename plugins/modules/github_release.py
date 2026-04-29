@@ -135,6 +135,14 @@ from ansible.module_utils.basic import AnsibleModule, missing_required_lib
 from ansible.module_utils.urls import fetch_url
 
 
+def _extract_github_error_message(raw_body):
+    """Extract error message from a GitHub API response body."""
+    try:
+        return json.loads(raw_body.decode("utf-8", errors="replace")).get("message", "")
+    except (ValueError, AttributeError):
+        return ""
+
+
 def get_latest_release(module, user, repo, token):
     """Fetch the latest release from GitHub API without requiring github3.py."""
     url = f"https://api.github.com/repos/{user}/{repo}/releases/latest"
@@ -161,14 +169,9 @@ def get_latest_release(module, user, repo, token):
             pass
 
     if status == 403:
-        error_msg = ""
-        try:
-            error_msg = json.loads(raw_body.decode("utf-8", errors="replace")).get("message", "")
-        except Exception:
-            pass
         module.fail_json(
             msg=f"GitHub API rate limit or access error (HTTP 403) for {user}/{repo}",
-            details=error_msg,
+            details=_extract_github_error_message(raw_body),
         )
 
     if status == 401:
@@ -178,19 +181,15 @@ def get_latest_release(module, user, repo, token):
         )
 
     if status < 200 or status >= 300:
-        error_msg = ""
-        try:
-            error_msg = json.loads(raw_body.decode("utf-8", errors="replace")).get("message", "")
-        except Exception:
-            pass
+        error_msg = _extract_github_error_message(raw_body) or info.get("msg", "")
         module.fail_json(
             msg=f"GitHub API error (HTTP {status}) for {user}/{repo}",
-            details=error_msg or info.get("msg", ""),
+            details=error_msg,
         )
 
     try:
         data = json.loads(raw_body.decode("utf-8"))
-    except Exception as e:
+    except (ValueError, UnicodeDecodeError) as e:
         module.fail_json(msg=f"Failed to parse GitHub API response: {e}")
 
     return data.get("tag_name")

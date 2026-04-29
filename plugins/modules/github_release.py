@@ -40,6 +40,8 @@ options:
   action:
     description:
       - Action to perform.
+      - The V(latest_release) action does not require the C(github3.py) library.
+      - The V(create_release) action requires C(github3.py >= 1.0.0a3).
     type: str
     required: true
     choices: ['latest_release', 'create_release']
@@ -73,7 +75,7 @@ options:
 author:
   - "Adrian Moisey (@adrianmoisey)"
 requirements:
-  - "github3.py >= 1.0.0a3"
+  - "github3.py >= 1.0.0a3 (only required for O(action=create_release))"
 """
 
 EXAMPLES = r"""
@@ -117,6 +119,7 @@ tag:
   sample: 1.1.0
 """
 
+import json
 import traceback
 
 GITHUB_IMP_ERR = None
@@ -129,6 +132,63 @@ except ImportError:
     HAS_GITHUB_API = False
 
 from ansible.module_utils.basic import AnsibleModule, missing_required_lib
+from ansible.module_utils.urls import fetch_url
+
+
+def get_latest_release(module, user, repo, token):
+    """Fetch the latest release from GitHub API without requiring github3.py."""
+    url = f"https://api.github.com/repos/{user}/{repo}/releases/latest"
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "ansible-community.general/github_release",
+    }
+    if token:
+        headers["Authorization"] = f"token {token}"
+
+    resp, info = fetch_url(module, url, headers=headers, method="GET")
+
+    status = info["status"]
+
+    if status == 404:
+        # No releases exist for this repository
+        return None
+
+    if status == 403:
+        body = ""
+        if resp is not None:
+            try:
+                body = json.loads(resp.read().decode("utf-8", errors="replace")).get("message", "")
+            except Exception:
+                pass
+        module.fail_json(
+            msg=f"GitHub API rate limit or access error (HTTP 403) for {user}/{repo}",
+            details=body,
+        )
+
+    if status == 401:
+        module.fail_json(
+            msg=f"GitHub API authentication failed (HTTP 401) for {user}/{repo}",
+            details="Please check your token.",
+        )
+
+    if status < 200 or status >= 300:
+        body = ""
+        if resp is not None:
+            try:
+                body = json.loads(resp.read().decode("utf-8", errors="replace")).get("message", "")
+            except Exception:
+                pass
+        module.fail_json(
+            msg=f"GitHub API error (HTTP {status}) for {user}/{repo}",
+            details=body or info.get("msg", ""),
+        )
+
+    try:
+        data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        module.fail_json(msg=f"Failed to parse GitHub API response: {e}")
+
+    return data.get("tag_name")
 
 
 def main():
@@ -151,68 +211,66 @@ def main():
         required_if=[("action", "create_release", ["tag"]), ("action", "create_release", ["password", "token"], True)],
     )
 
-    if not HAS_GITHUB_API:
-        module.fail_json(msg=missing_required_lib("github3.py >= 1.0.0a3"), exception=GITHUB_IMP_ERR)
-
     repo = module.params["repo"]
     user = module.params["user"]
     password = module.params["password"]
     login_token = module.params["token"]
     action = module.params["action"]
-    tag = module.params.get("tag")
-    target = module.params.get("target")
-    name = module.params.get("name")
-    body = module.params.get("body")
-    draft = module.params.get("draft")
-    prerelease = module.params.get("prerelease")
-
-    # login to github
-    try:
-        if password:
-            gh_obj = github3.login(user, password=password)
-        elif login_token:
-            gh_obj = github3.login(token=login_token)
-        else:
-            gh_obj = github3.GitHub()
-
-        # GitHub's token formats:
-        #   - ghp_          - Personal access token (classic)
-        #   - github_pat_   - Fine-grained personal access token
-        #   - gho_          - OAuth access token
-        #   - ghu_          - User access token for a GitHub App
-        #   - ghs_          - Installation access token for a GitHub App
-        #   - ghr_          - Refresh token for a GitHub App
-        #
-        # References:
-        #   https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/about-authentication-to-github#githubs-token-formats
-        #
-        # Test if we're actually logged in, but skip this check for some token prefixes
-        SKIPPED_TOKEN_PREFIXES = ["ghs_"]
-        if password or (login_token and not any(login_token.startswith(prefix) for prefix in SKIPPED_TOKEN_PREFIXES)):
-            gh_obj.me()
-    except github3.exceptions.AuthenticationFailed as e:
-        module.fail_json(
-            msg=f"Failed to connect to GitHub: {e}",
-            details=f"Please check username and password or token for repository {repo}",
-        )
-    except github3.exceptions.GitHubError as e:
-        module.fail_json(
-            msg=f"GitHub API error: {e}", details=f"Please check username and password or token for repository {repo}"
-        )
-
-    repository = gh_obj.repository(user, repo)
-
-    if not repository:
-        module.fail_json(msg=f"Repository {user}/{repo} doesn't exist")
 
     if action == "latest_release":
-        release = repository.latest_release()
-        if release:
-            module.exit_json(tag=release.tag_name)
-        else:
-            module.exit_json(tag=None)
+        tag_name = get_latest_release(module, user, repo, login_token)
+        module.exit_json(tag=tag_name)
 
     if action == "create_release":
+        if not HAS_GITHUB_API:
+            module.fail_json(msg=missing_required_lib("github3.py >= 1.0.0a3"), exception=GITHUB_IMP_ERR)
+
+        tag = module.params.get("tag")
+        target = module.params.get("target")
+        name = module.params.get("name")
+        body = module.params.get("body")
+        draft = module.params.get("draft")
+        prerelease = module.params.get("prerelease")
+
+        # login to github
+        try:
+            if password:
+                gh_obj = github3.login(user, password=password)
+            elif login_token:
+                gh_obj = github3.login(token=login_token)
+            else:
+                gh_obj = github3.GitHub()
+
+            # GitHub's token formats:
+            #   - ghp_          - Personal access token (classic)
+            #   - github_pat_   - Fine-grained personal access token
+            #   - gho_          - OAuth access token
+            #   - ghu_          - User access token for a GitHub App
+            #   - ghs_          - Installation access token for a GitHub App
+            #   - ghr_          - Refresh token for a GitHub App
+            #
+            # References:
+            #   https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/about-authentication-to-github#githubs-token-formats
+            #
+            # Test if we're actually logged in, but skip this check for some token prefixes
+            SKIPPED_TOKEN_PREFIXES = ["ghs_"]
+            if password or (login_token and not any(login_token.startswith(prefix) for prefix in SKIPPED_TOKEN_PREFIXES)):
+                gh_obj.me()
+        except github3.exceptions.AuthenticationFailed as e:
+            module.fail_json(
+                msg=f"Failed to connect to GitHub: {e}",
+                details=f"Please check username and password or token for repository {repo}",
+            )
+        except github3.exceptions.GitHubError as e:
+            module.fail_json(
+                msg=f"GitHub API error: {e}", details=f"Please check username and password or token for repository {repo}"
+            )
+
+        repository = gh_obj.repository(user, repo)
+
+        if not repository:
+            module.fail_json(msg=f"Repository {user}/{repo} doesn't exist")
+
         release_exists = repository.release_from_tag(tag)
         if release_exists:
             module.exit_json(changed=False, msg=f"Release for tag {tag} already exists.")

@@ -153,16 +153,22 @@ def get_latest_release(module, user, repo, token):
         # No releases exist for this repository
         return None
 
+    raw_body = b""
+    if resp is not None:
+        try:
+            raw_body = resp.read()
+        except Exception:
+            pass
+
     if status == 403:
-        body = ""
-        if resp is not None:
-            try:
-                body = json.loads(resp.read().decode("utf-8", errors="replace")).get("message", "")
-            except Exception:
-                pass
+        error_msg = ""
+        try:
+            error_msg = json.loads(raw_body.decode("utf-8", errors="replace")).get("message", "")
+        except Exception:
+            pass
         module.fail_json(
             msg=f"GitHub API rate limit or access error (HTTP 403) for {user}/{repo}",
-            details=body,
+            details=error_msg,
         )
 
     if status == 401:
@@ -172,19 +178,18 @@ def get_latest_release(module, user, repo, token):
         )
 
     if status < 200 or status >= 300:
-        body = ""
-        if resp is not None:
-            try:
-                body = json.loads(resp.read().decode("utf-8", errors="replace")).get("message", "")
-            except Exception:
-                pass
+        error_msg = ""
+        try:
+            error_msg = json.loads(raw_body.decode("utf-8", errors="replace")).get("message", "")
+        except Exception:
+            pass
         module.fail_json(
             msg=f"GitHub API error (HTTP {status}) for {user}/{repo}",
-            details=body or info.get("msg", ""),
+            details=error_msg or info.get("msg", ""),
         )
 
     try:
-        data = json.loads(resp.read().decode("utf-8"))
+        data = json.loads(raw_body.decode("utf-8"))
     except Exception as e:
         module.fail_json(msg=f"Failed to parse GitHub API response: {e}")
 

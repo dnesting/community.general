@@ -223,7 +223,7 @@ def test_latest_release_rate_limit_no_reset_header(fetch_url_mock):
 
 
 def test_latest_release_rate_limit_reset_in_past(fetch_url_mock):
-    """rate_limit_wait is omitted when the reset timestamp has already passed."""
+    """rate_limit_wait is 0 when the reset timestamp has already passed."""
     past_ts = str(int(time.time()) - 60)
     fetch_url_mock.return_value = make_fetch_url_response(
         {"message": "API rate limit exceeded"},
@@ -243,7 +243,7 @@ def test_latest_release_rate_limit_reset_in_past(fetch_url_mock):
 
     result = exc.value.args[0]
     assert "rate limit" in result["msg"].lower()
-    assert "rate_limit_wait" not in result
+    assert result["rate_limit_wait"] == 0
 
 
 def test_latest_release_rate_limit_invalid_reset_header(fetch_url_mock):

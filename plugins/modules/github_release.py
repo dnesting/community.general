@@ -40,8 +40,6 @@ options:
   action:
     description:
       - Action to perform.
-      - The V(latest_release) action does not require the C(github3.py) library.
-      - The V(create_release) action requires C(github3.py >= 1.0.0a3).
     type: str
     required: true
     choices: ['latest_release', 'create_release']
@@ -159,10 +157,9 @@ def _fail_rate_limited(module, info, token):
             delta = int(reset_timestamp) - int(time.time())
             if delta > 0:
                 rate_limit_wait = delta
-                details_parts.append(
-                    f"resets in {delta}s; use the rate_limit_wait return value to delay before retrying"
-                )
+                details_parts.append(f"resets in {delta}s")
             else:
+                rate_limit_wait = 0
                 details_parts.append("rate limit has reset; try again")
         except ValueError:
             details_parts.append(f"received invalid x-ratelimit-reset of {reset_timestamp!r}")

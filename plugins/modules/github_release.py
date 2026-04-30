@@ -73,7 +73,7 @@ options:
 author:
   - "Adrian Moisey (@adrianmoisey)"
 requirements:
-  - "github3.py >= 1.0.0a3"
+  - "github3.py >= 1.0.0a3 (required for O(action=create_release), or for O(action=latest_release) when using O(password) authentication)"
 """
 
 EXAMPLES = r"""
@@ -117,6 +117,8 @@ tag:
   sample: 1.1.0
 """
 
+import json
+import time
 import traceback
 
 GITHUB_IMP_ERR = None
@@ -129,44 +131,112 @@ except ImportError:
     HAS_GITHUB_API = False
 
 from ansible.module_utils.basic import AnsibleModule, missing_required_lib
+from ansible.module_utils.urls import fetch_url
 
 
-def main():
-    module = AnsibleModule(
-        argument_spec=dict(
-            repo=dict(required=True),
-            user=dict(required=True),
-            password=dict(no_log=True),
-            token=dict(no_log=True),
-            action=dict(required=True, choices=["latest_release", "create_release"]),
-            tag=dict(type="str"),
-            target=dict(type="str"),
-            name=dict(type="str"),
-            body=dict(type="str"),
-            draft=dict(type="bool", default=False),
-            prerelease=dict(type="bool", default=False),
-        ),
-        supports_check_mode=True,
-        mutually_exclusive=(("password", "token"),),
-        required_if=[("action", "create_release", ["tag"]), ("action", "create_release", ["password", "token"], True)],
+def _extract_github_error_message(raw_body):
+    """Extract error message from a GitHub API response body."""
+    try:
+        return json.loads(raw_body.decode("utf-8", errors="replace")).get("message", "")
+    except (ValueError, AttributeError):
+        return ""
+
+
+def _fail_rate_limited(module, info, token):
+    """Fail with a helpful message when GitHub API rate limiting is encountered."""
+    remaining = info.get("x-ratelimit-remaining", "")
+    reset_timestamp = info.get("x-ratelimit-reset", "")
+    limit = info.get("x-ratelimit-limit", "")
+
+    details_parts = []
+    rate_limit_wait = None
+    if limit:
+        details_parts.append(f"rate limit: {limit}, remaining: {remaining}")
+    if reset_timestamp:
+        try:
+            delta = int(reset_timestamp) - int(time.time())
+            if delta > 0:
+                rate_limit_wait = delta
+                details_parts.append(f"resets in {delta}s")
+            else:
+                rate_limit_wait = 0
+                details_parts.append("rate limit has reset; try again")
+        except ValueError:
+            details_parts.append(f"received invalid x-ratelimit-reset of {reset_timestamp!r}")
+    if not token:
+        details_parts.append(
+            "note: authenticating with a GitHub token grants higher API rate limits; "
+            "see https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api"
+        )
+
+    fail_kwargs = dict(
+        msg="GitHub API rate limit exceeded",
+        details="; ".join(details_parts),
     )
+    if rate_limit_wait is not None:
+        fail_kwargs["rate_limit_wait"] = rate_limit_wait
+    module.fail_json(**fail_kwargs)
 
-    if not HAS_GITHUB_API:
-        module.fail_json(msg=missing_required_lib("github3.py >= 1.0.0a3"), exception=GITHUB_IMP_ERR)
 
-    repo = module.params["repo"]
-    user = module.params["user"]
-    password = module.params["password"]
-    login_token = module.params["token"]
-    action = module.params["action"]
-    tag = module.params.get("tag")
-    target = module.params.get("target")
-    name = module.params.get("name")
-    body = module.params.get("body")
-    draft = module.params.get("draft")
-    prerelease = module.params.get("prerelease")
+def _get_latest_release(module, user, repo, token):
+    """Fetch the latest release from GitHub API without requiring github3.py."""
+    url = f"https://api.github.com/repos/{user}/{repo}/releases/latest"
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2026-03-10",
+        "User-Agent": "ansible-community.general/github_release",
+    }
+    if token:
+        headers["Authorization"] = f"token {token}"
 
-    # login to github
+    resp, info = fetch_url(module, url, headers=headers, method="GET")
+
+    status = info["status"]
+
+    if status == 404:
+        # No releases exist for this repository
+        return None
+
+    raw_body = b""
+    if resp is not None:
+        try:
+            raw_body = resp.read()
+        except Exception:
+            pass
+
+    # 429 is an explicit rate-limit response; 403 with x-ratelimit-remaining==0 also signals it
+    if status == 429 or (status == 403 and info.get("x-ratelimit-remaining") == "0"):
+        _fail_rate_limited(module, info, token)
+
+    if status == 403:
+        module.fail_json(
+            msg=f"GitHub API access error (HTTP 403) for {user}/{repo}",
+            details=_extract_github_error_message(raw_body),
+        )
+
+    if status == 401:
+        module.fail_json(
+            msg=f"GitHub API authentication failed (HTTP 401) for {user}/{repo}",
+            details="Please check your token.",
+        )
+
+    if status < 200 or status >= 300:
+        error_msg = _extract_github_error_message(raw_body) or info.get("msg", "")
+        module.fail_json(
+            msg=f"GitHub API error (HTTP {status}) for {user}/{repo}",
+            details=error_msg,
+        )
+
+    try:
+        data = json.loads(raw_body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as e:
+        module.fail_json(msg=f"Failed to parse GitHub API response: {e}")
+
+    return data.get("tag_name")
+
+
+def _github3_login(module, user, repo, password, login_token):
+    """Authenticate with GitHub using github3.py and return the session object."""
     try:
         if password:
             gh_obj = github3.login(user, password=password)
@@ -197,31 +267,94 @@ def main():
         )
     except github3.exceptions.GitHubError as e:
         module.fail_json(
-            msg=f"GitHub API error: {e}", details=f"Please check username and password or token for repository {repo}"
+            msg=f"GitHub API error: {e}",
+            details=f"Please check username and password or token for repository {repo}",
         )
+    return gh_obj
+
+
+def _github3_latest_release(module, user, repo, password, login_token):
+    """Fetch the latest release tag using github3.py (used when password auth is requested)."""
+    if not HAS_GITHUB_API:
+        module.fail_json(msg=missing_required_lib("github3.py >= 1.0.0a3"), exception=GITHUB_IMP_ERR)
+
+    gh_obj = _github3_login(module, user, repo, password, login_token)
 
     repository = gh_obj.repository(user, repo)
-
     if not repository:
         module.fail_json(msg=f"Repository {user}/{repo} doesn't exist")
 
+    release = repository.latest_release()
+    if release:
+        return release.tag_name
+    return None
+
+
+def _github3_create_release(module, user, repo, password, login_token, tag, target, name, body, draft, prerelease):
+    """Create a GitHub release using github3.py."""
+    if not HAS_GITHUB_API:
+        module.fail_json(msg=missing_required_lib("github3.py >= 1.0.0a3"), exception=GITHUB_IMP_ERR)
+
+    gh_obj = _github3_login(module, user, repo, password, login_token)
+
+    repository = gh_obj.repository(user, repo)
+    if not repository:
+        module.fail_json(msg=f"Repository {user}/{repo} doesn't exist")
+
+    release_exists = repository.release_from_tag(tag)
+    if release_exists:
+        module.exit_json(changed=False, msg=f"Release for tag {tag} already exists.")
+
+    release = repository.create_release(tag, target, name, body, draft, prerelease)
+    if release:
+        module.exit_json(changed=True, tag=release.tag_name)
+    else:
+        module.exit_json(changed=False, tag=None)
+
+
+def main():
+    module = AnsibleModule(
+        argument_spec=dict(
+            repo=dict(required=True),
+            user=dict(required=True),
+            password=dict(no_log=True),
+            token=dict(no_log=True),
+            action=dict(required=True, choices=["latest_release", "create_release"]),
+            tag=dict(type="str"),
+            target=dict(type="str"),
+            name=dict(type="str"),
+            body=dict(type="str"),
+            draft=dict(type="bool", default=False),
+            prerelease=dict(type="bool", default=False),
+        ),
+        supports_check_mode=True,
+        mutually_exclusive=(("password", "token"),),
+        required_if=[("action", "create_release", ["tag"]), ("action", "create_release", ["password", "token"], True)],
+    )
+
+    repo = module.params["repo"]
+    user = module.params["user"]
+    password = module.params["password"]
+    login_token = module.params["token"]
+    action = module.params["action"]
+
     if action == "latest_release":
-        release = repository.latest_release()
-        if release:
-            module.exit_json(tag=release.tag_name)
+        if password:
+            # Password-based auth requires github3.py
+            tag_name = _github3_latest_release(module, user, repo, password, login_token)
         else:
-            module.exit_json(tag=None)
+            # Token or unauthenticated: use the direct API path (no github3.py required)
+            tag_name = _get_latest_release(module, user, repo, login_token)
+        module.exit_json(tag=tag_name)
 
     if action == "create_release":
-        release_exists = repository.release_from_tag(tag)
-        if release_exists:
-            module.exit_json(changed=False, msg=f"Release for tag {tag} already exists.")
-
-        release = repository.create_release(tag, target, name, body, draft, prerelease)
-        if release:
-            module.exit_json(changed=True, tag=release.tag_name)
-        else:
-            module.exit_json(changed=False, tag=None)
+        tag = module.params.get("tag")
+        target = module.params.get("target")
+        name = module.params.get("name")
+        body = module.params.get("body")
+        draft = module.params.get("draft")
+        prerelease = module.params.get("prerelease")
+        _github3_create_release(module, user, repo, password, login_token, tag, target, name, body, draft, prerelease)
 
 
 if __name__ == "__main__":

@@ -40,8 +40,7 @@ options:
   action:
     description:
       - Action to perform.
-      - The V(latest_release) action uses a direct HTTPS request and does not require the C(github3.py) library,
-        unless O(password) authentication is used.
+      - The V(latest_release) action does not require the C(github3.py) library.
       - The V(create_release) action requires C(github3.py >= 1.0.0a3).
     type: str
     required: true
@@ -152,27 +151,37 @@ def _fail_rate_limited(module, info, token):
     limit = info.get("x-ratelimit-limit", "")
 
     details_parts = []
+    rate_limit_wait = None
     if limit:
         details_parts.append(f"rate limit: {limit}, remaining: {remaining}")
     if reset_timestamp:
         try:
             delta = int(reset_timestamp) - int(time.time())
             if delta > 0:
-                details_parts.append(f"resets in {delta}s (Unix timestamp {reset_timestamp})")
+                rate_limit_wait = delta
+                details_parts.append(
+                    f"resets in {delta}s; use the rate_limit_wait return value to delay before retrying"
+                )
             else:
-                details_parts.append(f"rate limit reset timestamp {reset_timestamp} has passed; try again")
+                details_parts.append("rate limit has reset; try again")
         except ValueError:
-            details_parts.append(f"resets at Unix timestamp {reset_timestamp}")
+            details_parts.append(f"received invalid x-ratelimit-reset of {reset_timestamp!r}")
     if not token:
-        details_parts.append("authenticating with a GitHub token grants higher API rate limits")
+        details_parts.append(
+            "note: authenticating with a GitHub token grants higher API rate limits; "
+            "see https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api"
+        )
 
-    module.fail_json(
+    fail_kwargs = dict(
         msg="GitHub API rate limit exceeded",
         details="; ".join(details_parts),
     )
+    if rate_limit_wait is not None:
+        fail_kwargs["rate_limit_wait"] = rate_limit_wait
+    module.fail_json(**fail_kwargs)
 
 
-def get_latest_release(module, user, repo, token):
+def _get_latest_release(module, user, repo, token):
     """Fetch the latest release from GitHub API without requiring github3.py."""
     url = f"https://api.github.com/repos/{user}/{repo}/releases/latest"
     headers = {
@@ -338,7 +347,7 @@ def main():
             tag_name = _github3_latest_release(module, user, repo, password, login_token)
         else:
             # Token or unauthenticated: use the direct API path (no github3.py required)
-            tag_name = get_latest_release(module, user, repo, login_token)
+            tag_name = _get_latest_release(module, user, repo, login_token)
         module.exit_json(tag=tag_name)
 
     if action == "create_release":

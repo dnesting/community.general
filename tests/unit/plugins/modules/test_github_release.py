@@ -141,16 +141,20 @@ def test_latest_release_rate_limit_403_with_header(fetch_url_mock):
     result = exc.value.args[0]
     assert "rate limit" in result["msg"].lower()
     assert "resets in" in result["details"]
+    # The wait delta should be emitted as rate_limit_wait
+    assert result["rate_limit_wait"] > 0
     # No token → hint about tokens should appear
-    assert "token" in result["details"].lower()
+    assert "note:" in result["details"]
+    assert "github token" in result["details"].lower()
 
 
 def test_latest_release_rate_limit_429(fetch_url_mock):
     """HTTP 429 is always a rate limit error."""
+    reset_ts = str(int(time.time()) + 60)
     fetch_url_mock.return_value = make_fetch_url_response(
         {"message": "Too Many Requests"},
         status=429,
-        extra_info={"x-ratelimit-remaining": "0", "x-ratelimit-limit": "60"},
+        extra_info={"x-ratelimit-remaining": "0", "x-ratelimit-limit": "60", "x-ratelimit-reset": reset_ts},
     )
 
     with set_module_args(
@@ -166,8 +170,10 @@ def test_latest_release_rate_limit_429(fetch_url_mock):
 
     result = exc.value.args[0]
     assert "rate limit" in result["msg"].lower()
+    # rate_limit_wait emitted and positive
+    assert result["rate_limit_wait"] > 0
     # Token provided → no token hint
-    assert "authenticating with a github token" not in result["details"].lower()
+    assert "note:" not in result["details"]
 
 
 def test_latest_release_403_not_rate_limit(fetch_url_mock):
@@ -191,6 +197,77 @@ def test_latest_release_403_not_rate_limit(fetch_url_mock):
     result = exc.value.args[0]
     assert "403" in result["msg"]
     assert "rate limit" not in result["msg"].lower()
+
+
+def test_latest_release_rate_limit_no_reset_header(fetch_url_mock):
+    """rate_limit_wait is omitted when x-ratelimit-reset is absent."""
+    fetch_url_mock.return_value = make_fetch_url_response(
+        {"message": "API rate limit exceeded"},
+        status=429,
+        extra_info={"x-ratelimit-remaining": "0"},
+    )
+
+    with set_module_args(
+        {
+            "user": "testuser",
+            "repo": "testrepo",
+            "action": "latest_release",
+        }
+    ):
+        with pytest.raises(AnsibleFailJson) as exc:
+            github_release.main()
+
+    result = exc.value.args[0]
+    assert "rate limit" in result["msg"].lower()
+    assert "rate_limit_wait" not in result
+
+
+def test_latest_release_rate_limit_reset_in_past(fetch_url_mock):
+    """rate_limit_wait is omitted when the reset timestamp has already passed."""
+    past_ts = str(int(time.time()) - 60)
+    fetch_url_mock.return_value = make_fetch_url_response(
+        {"message": "API rate limit exceeded"},
+        status=429,
+        extra_info={"x-ratelimit-remaining": "0", "x-ratelimit-reset": past_ts},
+    )
+
+    with set_module_args(
+        {
+            "user": "testuser",
+            "repo": "testrepo",
+            "action": "latest_release",
+        }
+    ):
+        with pytest.raises(AnsibleFailJson) as exc:
+            github_release.main()
+
+    result = exc.value.args[0]
+    assert "rate limit" in result["msg"].lower()
+    assert "rate_limit_wait" not in result
+
+
+def test_latest_release_rate_limit_invalid_reset_header(fetch_url_mock):
+    """Invalid x-ratelimit-reset value produces a clear error message."""
+    fetch_url_mock.return_value = make_fetch_url_response(
+        {"message": "API rate limit exceeded"},
+        status=429,
+        extra_info={"x-ratelimit-remaining": "0", "x-ratelimit-reset": "not-a-number"},
+    )
+
+    with set_module_args(
+        {
+            "user": "testuser",
+            "repo": "testrepo",
+            "action": "latest_release",
+        }
+    ):
+        with pytest.raises(AnsibleFailJson) as exc:
+            github_release.main()
+
+    result = exc.value.args[0]
+    assert "rate limit" in result["msg"].lower()
+    assert "invalid" in result["details"].lower()
+    assert "rate_limit_wait" not in result
 
 
 def test_latest_release_auth_failure(fetch_url_mock):
